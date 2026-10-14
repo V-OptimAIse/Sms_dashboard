@@ -64,9 +64,6 @@ def update_streamlit():
         count += 1
         sensor_reading = sensor_reading_new
 
-# Set the layout to a two-column format
-st.set_page_config(layout="wide")
-
 # Load Operator file
 operator_sheet = Path(__file__).parent.parent / 'OperatorDetails' / 'OperatorDetails.xlsx'
 st.session_state.df_op = pd.read_excel(operator_sheet)

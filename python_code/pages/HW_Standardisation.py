@@ -2,15 +2,13 @@ import streamlit as st
 import struct
 import math
 import os
+import threading
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
 
 
 from pymodbus.client import ModbusSerialClient
-from pymodbus.exceptions import ModbusIOException
-
-from streamlit_autorefresh import st_autorefresh
 
 # MQTT (CAMERA + GYRO ONLY)
 from mqtt_client import start_mqtt, latest_data, lock
@@ -105,9 +103,6 @@ div[data-testid="stVerticalBlock"]:first-child {
 # )
 
 
-# Refresh UI + Modbus reads every 1s (safe; avoids manual st.rerun hacks)
-
-
 # =====================================================
 # BASIC CONFIG
 # =====================================================
@@ -164,7 +159,7 @@ REG_DUAL_UPPER_F       = 4377  # 0x1119 (m, float)
 REG_DUAL_LOWER_F       = 4379  # 0x111B (m, float)
 REG_RETURN_DIFF_F      = 4381  # 0x111D (m, float)
 
-# Relay status (FC=0x03)
+# Relay status (FC=0x03; not polled by the live dashboard)
 REG_RELAY1_STATUS_I16  = 4383  # 0x111F (0/1)
 REG_RELAY2_STATUS_I16  = 4384  # 0x1120 (0/1)
 
@@ -175,7 +170,6 @@ REG_SLAVE_ADDR_I16     = 16390  # 0x4006 (FC=0x06)
 # =====================================================
 # CSV STORAGE (CSV ONLY, as requested)
 # =====================================================
-st_autorefresh(interval=1000, key="refresh_1s")
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -196,9 +190,23 @@ if not os.path.exists(HISTORY_FILE):
 if not os.path.exists(PROFILE_FILE):
     pd.DataFrame(columns=["ladle_id", "empty_distance_m", "updated_at"]).to_csv(PROFILE_FILE, index=False)
 
+
+def file_mtime_ns(path: str) -> int:
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return 0
+
+
+@st.cache_data(show_spinner=False)
+def read_csv_cached(path: str, mtime_ns: int) -> pd.DataFrame:
+    """Parse a CSV only when its path or modification time changes."""
+    return pd.read_csv(path)
+
+
 def load_profiles() -> dict:
     try:
-        df = pd.read_csv(PROFILE_FILE)
+        df = read_csv_cached(PROFILE_FILE, file_mtime_ns(PROFILE_FILE))
         out = {}
         for _, r in df.iterrows():
             lid = str(r.get("ladle_id", "")).strip()
@@ -214,7 +222,7 @@ def save_profile(ladle_id: str, empty_distance_m: float):
         return
     now_ts = datetime.now().isoformat(timespec="seconds")
     try:
-        df = pd.read_csv(PROFILE_FILE)
+        df = read_csv_cached(PROFILE_FILE, file_mtime_ns(PROFILE_FILE))
     except Exception:
         df = pd.DataFrame(columns=["ladle_id", "empty_distance_m", "updated_at"])
 
@@ -227,7 +235,7 @@ def delete_profile(ladle_id: str):
     if not ladle_id:
         return
     try:
-        df = pd.read_csv(PROFILE_FILE)
+        df = read_csv_cached(PROFILE_FILE, file_mtime_ns(PROFILE_FILE))
         df = df[df["ladle_id"] != ladle_id]
         df.to_csv(PROFILE_FILE, index=False)
     except Exception:
@@ -236,35 +244,58 @@ def delete_profile(ladle_id: str):
 # =====================================================
 # MODBUS HELPERS
 # =====================================================
-def mb_client(port: str) -> ModbusSerialClient:
-    c = ModbusSerialClient(
+@st.cache_resource(show_spinner=False)
+def modbus_resource(port: str):
+    client = ModbusSerialClient(
         port=port,
         baudrate=BAUDRATE,
         bytesize=8,
         parity="N",
         stopbits=1,
-        timeout=1,
+        timeout=0.3,
+        retries=0,
     )
-    c.unit_id = SLAVE_ID
-    return c
+    client.unit_id = SLAVE_ID
+    return client, threading.Lock()
+
+
+def _close_failed_client(client: ModbusSerialClient):
+    try:
+        client.close()
+    except Exception:
+        pass
+
 
 def _read_regs(port: str, start_reg: int, count: int):
-    c = mb_client(port)
-    if not c.connect():
+    client, client_lock = modbus_resource(port)
+    with client_lock:
+        try:
+            if not client.connected and not client.connect():
+                return None
+            response = client.read_holding_registers(
+                start_reg,
+                count=count,
+                device_id=SLAVE_ID,
+            )
+            if response is None or response.isError():
+                _close_failed_client(client)
+                return None
+            return response.registers
+        except Exception:
+            _close_failed_client(client)
+            return None
+
+
+def _decode_f32_be(registers, offset: int):
+    if registers is None or len(registers) < offset + 2:
         return None
-    rr = c.read_holding_registers(start_reg, count=count)
-    c.close()
-    if rr is None or rr.isError():
-        return None
-    return rr.registers
+    r0, r1 = registers[offset:offset + 2]
+    raw = bytes([(r0 >> 8) & 0xFF, r0 & 0xFF, (r1 >> 8) & 0xFF, r1 & 0xFF])
+    return struct.unpack(">f", raw)[0]
 
 def read_f32_be(port: str, start_reg: int):
     regs = _read_regs(port, start_reg, 2)
-    if not regs:
-        return None
-    r0, r1 = regs
-    raw = bytes([(r0 >> 8) & 0xFF, r0 & 0xFF, (r1 >> 8) & 0xFF, r1 & 0xFF])
-    return struct.unpack(">f", raw)[0]
+    return _decode_f32_be(regs, 0)
 
 def read_i32_be(port: str, start_reg: int):
     regs = _read_regs(port, start_reg, 2)
@@ -281,78 +312,125 @@ def read_i16(port: str, reg: int):
     v = regs[0]
     return v - 0x10000 if v >= 0x8000 else v
 
+
+def read_monitoring_block(port: str) -> dict:
+    registers = _read_regs(port, REG_SPACE_HEIGHT_F, 16)
+    return {
+        "distance_m": _decode_f32_be(registers, REG_SPACE_HEIGHT_F - REG_SPACE_HEIGHT_F),
+        "material_height_m": _decode_f32_be(registers, REG_MATERIAL_HEIGHT_F - REG_SPACE_HEIGHT_F),
+        "material_pct": _decode_f32_be(registers, REG_MATERIAL_PCT_F - REG_SPACE_HEIGHT_F),
+        "current_ma": _decode_f32_be(registers, REG_CURRENT_F - REG_SPACE_HEIGHT_F),
+        "temperature_c": _decode_f32_be(registers, REG_TEMPERATURE_F - REG_SPACE_HEIGHT_F),
+    }
+
+
+def _perform_write(port: str, operation, success_message="Written"):
+    client, client_lock = modbus_resource(port)
+    with client_lock:
+        try:
+            if not client.connected and not client.connect():
+                return False, "Connection failed"
+            response = operation(client)
+            if response is not None and not response.isError():
+                return True, success_message
+            _close_failed_client(client)
+            return False, "Write failed"
+        except Exception as exc:
+            _close_failed_client(client)
+            return False, str(exc)
+
+
 def write_f32_fc10_be(port: str, start_reg: int, value: float):
-    try:
-        c = mb_client(port)
-        if not c.connect():
-            return False, "Connection failed"
-        raw = struct.pack(">f", float(value))
-        regs = [(raw[0] << 8) | raw[1], (raw[2] << 8) | raw[3]]
-        rq = c.write_registers(start_reg, regs)  # FC=0x10
-        c.close()
-        if rq and not rq.isError():
-            return True, "Written"
-        return False, "Write failed"
-    except Exception as e:
-        return False, str(e)
+    raw = struct.pack(">f", float(value))
+    regs = [(raw[0] << 8) | raw[1], (raw[2] << 8) | raw[3]]
+    return _perform_write(
+        port,
+        lambda client: client.write_registers(start_reg, regs, device_id=SLAVE_ID),  # FC=0x10
+    )
 
 def write_i32_fc10_be(port: str, start_reg: int, value: int):
-    try:
-        c = mb_client(port)
-        if not c.connect():
-            return False, "Connection failed"
-        raw = struct.pack(">i", int(value))
-        regs = [(raw[0] << 8) | raw[1], (raw[2] << 8) | raw[3]]
-        rq = c.write_registers(start_reg, regs)  # FC=0x10
-        c.close()
-        if rq and not rq.isError():
-            return True, "Written"
-        return False, "Write failed"
-    except Exception as e:
-        return False, str(e)
+    raw = struct.pack(">i", int(value))
+    regs = [(raw[0] << 8) | raw[1], (raw[2] << 8) | raw[3]]
+    return _perform_write(
+        port,
+        lambda client: client.write_registers(start_reg, regs, device_id=SLAVE_ID),  # FC=0x10
+    )
 
 def write_i16_fc10(port: str, reg: int, value: int):
-    try:
-        c = mb_client(port)
-        if not c.connect():
-            return False, "Connection failed"
-        rq = c.write_registers(reg, [int(value) & 0xFFFF])  # FC=0x10 (1 reg)
-        c.close()
-        if rq and not rq.isError():
-            return True, "Written"
-        return False, "Write failed"
-    except Exception as e:
-        return False, str(e)
+    return _perform_write(
+        port,
+        lambda client: client.write_registers(
+            reg,
+            [int(value) & 0xFFFF],
+            device_id=SLAVE_ID,
+        ),  # FC=0x10 (1 reg)
+    )
 
 def write_slave_addr_fc06(port: str, reg: int, value: int):
-    try:
-        c = mb_client(port)
-        if not c.connect():
-            return False, "Connection failed"
-        rq = c.write_register(reg, int(value) & 0xFFFF)  # FC=0x06
-        c.close()
-        if rq and not rq.isError():
-            return True, "Written"
-        return False, "Write failed"
-    except Exception as e:
-        return False, str(e)
+    return _perform_write(
+        port,
+        lambda client: client.write_register(
+            reg,
+            int(value) & 0xFFFF,
+            device_id=SLAVE_ID,
+        ),  # FC=0x06
+    )
 
 def write_restart_word_swap_fc10(port: str):
     """
     Manual: write 32-bit int to 0x1112 to restart, with word-swapped order.
     For value=1: send [0x0001, 0x0000]
     """
-    try:
-        c = mb_client(port)
-        if not c.connect():
-            return False, "Connection failed"
-        rq = c.write_registers(REG_RESTART_I32, [0x0001, 0x0000])  # FC=0x10
-        c.close()
-        if rq and not rq.isError():
-            return True, "Restart command sent"
-        return False, "Write failed"
-    except Exception as e:
-        return False, str(e)
+    return _perform_write(
+        port,
+        lambda client: client.write_registers(
+            REG_RESTART_I32,
+            [0x0001, 0x0000],
+            device_id=SLAVE_ID,
+        ),  # FC=0x10
+        success_message="Restart command sent",
+    )
+
+# =====================================================
+# POUR CALLBACKS
+# =====================================================
+def start_pouring():
+    state = st.session_state
+    state.pouring = True
+    state.pour_start_time = datetime.now()
+    state.start_height = None
+    state.start_tons = None
+
+
+def stop_pouring(ladle_id, ladle_type, track_no, pour_no, operator, shift):
+    state = st.session_state
+    state.pouring = False
+
+    if state.pour_start_time is not None and state.start_height is not None:
+        live = state.get("live", {})
+        history = read_csv_cached(HISTORY_FILE, file_mtime_ns(HISTORY_FILE))
+        history.loc[len(history)] = [
+            ladle_id,
+            ladle_type,
+            track_no,
+            pour_no,
+            operator,
+            shift,
+            state.pour_start_time,
+            datetime.now(),
+            state.start_height,
+            live.get("material_height_m"),
+            state.start_tons,
+            live.get("ladle_tons"),
+            state.empty_distance,
+            state.calibration_source,
+        ]
+        history.to_csv(HISTORY_FILE, index=False)
+
+    state.pour_start_time = None
+    state.start_height = None
+    state.start_tons = None
+
 
 # =====================================================
 # START MQTT (CAMERA + GYRO ONLY)
@@ -374,6 +452,14 @@ ss.setdefault("pouring", False)
 ss.setdefault("pour_start_time", None)
 ss.setdefault("start_height", None)
 ss.setdefault("start_tons", None)
+ss.setdefault("live", {
+    "distance_m": None,
+    "material_height_m": None,
+    "material_pct": None,
+    "ladle_tons": None,
+    "current_ma": None,
+    "temperature_c": None,
+})
 
 # =====================================================
 # SIDEBAR: Operator + Ladle + Pour controls + Calibration + Engineer login
@@ -390,8 +476,6 @@ ladle_type = st.sidebar.selectbox("Ladle Type", list(LADLE_PROFILES.keys()))
 track_no = st.sidebar.selectbox("Track / Line", ["Track-1", "Track-2", "Track-3"])
 pour_no = st.sidebar.selectbox("Pour Count", [1, 2])
 
-now = datetime.now()
-
 # Auto-load empty distance when ladle changes
 if ladle_id and ss.last_loaded_ladle != ladle_id:
     ss.profiles = load_profiles()
@@ -406,20 +490,16 @@ if ladle_id and ss.last_loaded_ladle != ladle_id:
 st.sidebar.markdown("---")
 st.sidebar.subheader("Pour Control (Manual)")
 if not ss.pouring:
-    if st.sidebar.button("▶ Start Pouring"):
-        ss.pouring = True
-        ss.pour_start_time = now
-        ss.start_height = None
-        ss.start_tons = None
+    st.sidebar.button("▶ Start Pouring", on_click=start_pouring)
 else:
-    if st.sidebar.button("⏹ Stop Pouring"):
-        ss.pouring = False
+    st.sidebar.button(
+        "⏹ Stop Pouring",
+        on_click=stop_pouring,
+        args=(ladle_id, ladle_type, track_no, pour_no, operator, shift),
+    )
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("🧭 Calibration")
-
-# Read current distance (space height)
-distance_m = read_f32_be(port, REG_SPACE_HEIGHT_F)
 
 if ss.empty_distance is not None:
     st.sidebar.caption(f"Empty distance (m): {ss.empty_distance:.3f}  [{ss.calibration_source}]")
@@ -431,6 +511,7 @@ if calib_locked:
     st.sidebar.warning("Calibration locked during POURING")
 
 if st.sidebar.button("Set Current Distance as EMPTY", disabled=calib_locked):
+    distance_m = ss.live.get("distance_m")
     if not ladle_id:
         st.sidebar.error("Enter Ladle ID first")
     elif distance_m is None:
@@ -467,93 +548,6 @@ if enable_engineer:
 else:
     ss.engineer_mode = False
 
-# =====================================================
-# READ MONITORING VALUES (FC=0x03)
-# =====================================================
-material_h_dev = read_f32_be(port, REG_MATERIAL_HEIGHT_F)
-material_pct_dev = read_f32_be(port, REG_MATERIAL_PCT_F)
-current_ma = read_f32_be(port, REG_CURRENT_F)
-temperature_c = read_f32_be(port, REG_TEMPERATURE_F)
-
-relay1 = read_i16(port, REG_RELAY1_STATUS_I16)
-relay2 = read_i16(port, REG_RELAY2_STATUS_I16)
-
-# =====================================================
-# MATERIAL HEIGHT (RADAR DIRECT – NO LADLE PROFILE)
-# =====================================================
-material_height_m = material_h_dev
-
-
-# =====================================================
-# GEOMETRY-BASED TONS + FILL FRACTION
-# =====================================================
-geom = LADLE_PROFILES[ladle_type]
-ladle_tons = None
-fill_frac = None
-overfill = False
-
-if material_height_m is not None:
-    H = geom["height_m"]
-    r_bottom = geom["bottom_diameter_m"] / 2.0
-    r_top = geom["top_diameter_m"] / 2.0
-
-    h = max(0.0, min(material_height_m, H))
-    r_h = r_bottom + (r_top - r_bottom) * (h / H if H > 0 else 0.0)
-
-    volume_m3 = (math.pi * h / 3.0) * (r_bottom**2 + r_bottom * r_h + r_h**2)
-    ladle_tons = (volume_m3 * 7000.0) / 1000.0
-    fill_frac = ladle_tons / float(geom["capacity_tons"]) if geom["capacity_tons"] else None
-
-    if fill_frac is not None and fill_frac > (1.0 + OVERFILL_TOL):
-        overfill = True
-
-# Save start values on first frame after start
-if ss.pouring and ss.start_height is None and material_height_m is not None:
-    ss.start_height = material_height_m
-    ss.start_tons = ladle_tons
-
-# Save pour history on stop (only once)
-if (not ss.pouring) and ss.pour_start_time and (ss.start_height is not None):
-    dfh = pd.read_csv(HISTORY_FILE)
-    dfh.loc[len(dfh)] = [
-        ladle_id,
-        ladle_type,
-        track_no,
-        pour_no,
-        operator,
-        shift,
-        ss.pour_start_time,
-        now,
-        ss.start_height,
-        material_height_m,
-        ss.start_tons,
-        ladle_tons,
-        ss.empty_distance,
-        ss.calibration_source,
-    ]
-    dfh.to_csv(HISTORY_FILE, index=False)
-
-    ss.pour_start_time = None
-    ss.start_height = None
-    ss.start_tons = None
-
-# =====================================================
-# MQTT DATA (CAMERA + GYRO)
-# =====================================================
-with lock:
-    frame = latest_data.get("frame")
-    gyro = latest_data.get("gyro", {})
-# =====================================================
-# 🖥️ MAIN DASHBOARD – 4 QUADRANT RESPONSIVE LAYOUT
-# =====================================================
-
-if overfill:
-    st.markdown("""
-    <div class="alarm">
-        🚨 OVERFILL ALARM: Fill exceeds ladle capacity!
-    </div>
-    """, unsafe_allow_html=True)
-
 
 def metric_row(label, value):
     st.markdown(
@@ -566,138 +560,174 @@ def metric_row(label, value):
         unsafe_allow_html=True,
     )
 
-# ---------- ROW 1 : Radar + Gyro + Status ----------
-q1, q2, q_status = st.columns([4, 4, 2], gap="medium")
 
-#  Radar Data
-with q1:
-    st.markdown("<div class='quad'>", unsafe_allow_html=True)
-    st.markdown("### 📡 Radar Data")
+GYRO_FIELDS = [
+    ("Gyro X", "gyro_x"),
+    ("Gyro Y", "gyro_y"),
+    ("Gyro Z", "gyro_z"),
+    ("Accel X", "accel_x"),
+    ("Accel Y", "accel_y"),
+    ("Accel Z", "accel_z"),
+]
 
-
-    a, b, c = st.columns(3)
-
-    with a:
-        metric_row("Distance (m)", f"{distance_m:.3f}" if distance_m is not None else "—")
-        metric_row("Material Height (m)", f"{material_height_m:.3f}" if material_height_m is not None else "—")
-
-
-    with b:
-        metric_row("Device Fill %", f"{material_pct_dev:.1f}%" if material_pct_dev is not None else "—")
-        metric_row("Calculated Tons", f"{ladle_tons:.2f}" if ladle_tons is not None else "—")
+LADLE_IMAGE_DIR = Path(__file__).parent.parent / "LadleImages"
+AVAILABLE_LADLE_IMAGES = {}
+for image_path in LADLE_IMAGE_DIR.glob("Ladle_Image_*.png"):
+    try:
+        AVAILABLE_LADLE_IMAGES[int(image_path.stem.rsplit("_", 1)[1])] = image_path
+    except ValueError:
+        pass
 
 
-    with c:
-        metric_row("Current (mA)", f"{current_ma:.1f}" if current_ma is not None else "—")
-        metric_row("Temperature (°C)", f"{temperature_c:.1f}" if temperature_c is not None else "—")
-        # metric_row("Relay 1", relay1 if relay1 is not None else "—")
-        # metric_row("Relay 2", relay2 if relay2 is not None else "—")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# ---------- Gyro ----------
-with q2:
-    st.markdown("<div class='quad'>", unsafe_allow_html=True)
-    st.markdown("### 🧭 Gyro")
-
-    # 🔧 CONTROL WHAT YOU WANT TO SHOW HERE (order matters)
-    GYRO_FIELDS = [
-        ("Gyro X", "gyro_x"),
-        ("Gyro Y", "gyro_y"),
-        ("Gyro Z", "gyro_z"),
-        ("Accel X", "accel_x"),
-        ("Accel Y", "accel_y"),
-        ("Accel Z", "accel_z"),
-    ]
-
-    g1, g2, g3 = st.columns(3)
-    cols = [g1, g2, g3]
-
-    if gyro:
-        for i, (label, key) in enumerate(GYRO_FIELDS):
-            col = cols[i % 3]
-
-            value = "—"
-            if key in gyro and gyro[key] is not None:
-                try:
-                    value = f"{float(gyro[key]):.2f}"
-                except Exception:
-                    value = str(gyro[key])
-
-            with col:
-                metric_row(label, value)
-    else:
-        metric_row("STATUS", "Waiting for gyro data...")
-
-    st.markdown("</div>", unsafe_allow_html=True)
+def snapped_ladle_image(material_pct):
+    requested_fill = int(round(material_pct)) if material_pct is not None else 0
+    requested_fill = max(0, min(requested_fill, 100))
+    requested_fill = int(round(requested_fill / 5) * 5)
+    if not AVAILABLE_LADLE_IMAGES:
+        return requested_fill, LADLE_IMAGE_DIR / f"Ladle_Image_{requested_fill}.png"
+    fill_pct = min(AVAILABLE_LADLE_IMAGES, key=lambda level: abs(level - requested_fill))
+    return fill_pct, AVAILABLE_LADLE_IMAGES[fill_pct]
 
 
-#  POUR STATUS (same row)
-with q_status:
-    st.markdown(
-        f"""
-        <div style="
-            height: var(--quadH);
-            display: flex;
-            align-items: flex-start;   /* ⬅ top aligned */
-            justify-content: flex-start;
-            font-size: 1.6em;
-            font-weight: 700;
-            white-space: nowrap;
-            padding-top: 1rem;       /* optional spacing from top */
-        ">
-            {'🟢 POURING' if ss.pouring else '🟡 READY'}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+@st.fragment(run_every="1s")
+def live_dashboard(port: str, ladle_type: str, pouring: bool):
+    readings = read_monitoring_block(port)
+    distance_m = readings["distance_m"]
+    material_height_m = readings["material_height_m"]
+    material_pct_dev = readings["material_pct"]
+    current_ma = readings["current_ma"]
+    temperature_c = readings["temperature_c"]
+
+    # Geometry-based tons and fill fraction (unchanged calculation).
+    geom = LADLE_PROFILES[ladle_type]
+    ladle_tons = None
+    fill_frac = None
+    overfill = False
+
+    if material_height_m is not None:
+        H = geom["height_m"]
+        r_bottom = geom["bottom_diameter_m"] / 2.0
+        r_top = geom["top_diameter_m"] / 2.0
+
+        h = max(0.0, min(material_height_m, H))
+        r_h = r_bottom + (r_top - r_bottom) * (h / H if H > 0 else 0.0)
+
+        volume_m3 = (math.pi * h / 3.0) * (r_bottom**2 + r_bottom * r_h + r_h**2)
+        ladle_tons = (volume_m3 * 7000.0) / 1000.0
+        fill_frac = ladle_tons / float(geom["capacity_tons"]) if geom["capacity_tons"] else None
+
+        if fill_frac is not None and fill_frac > (1.0 + OVERFILL_TOL):
+            overfill = True
+
+    st.session_state.live = {
+        "distance_m": distance_m,
+        "material_height_m": material_height_m,
+        "material_pct": material_pct_dev,
+        "ladle_tons": ladle_tons,
+        "fill_frac": fill_frac,
+        "current_ma": current_ma,
+        "temperature_c": temperature_c,
+    }
+
+    # Capture the first valid reading after pouring begins.
+    if pouring and st.session_state.start_height is None and material_height_m is not None:
+        st.session_state.start_height = material_height_m
+        st.session_state.start_tons = ladle_tons
+
+    with lock:
+        frame = latest_data.get("frame")
+        gyro = dict(latest_data.get("gyro") or {})
+
+    # Fixed-height containers keep the live fragment from shifting surrounding UI.
+    with st.container(height=50, border=False):
+        if overfill:
+            st.markdown(
+                '<div class="alarm">🚨 OVERFILL ALARM: Fill exceeds ladle capacity!</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown("&nbsp;", unsafe_allow_html=True)
+
+    with st.container(height=265, border=False):
+        q1, q2, q_status = st.columns([4, 4, 2], gap="medium")
+
+        with q1:
+            st.markdown("<div class='quad'>", unsafe_allow_html=True)
+            st.markdown("### 📡 Radar Data")
+            a, b, c = st.columns(3)
+            with a:
+                metric_row("Distance (m)", f"{distance_m:.3f}" if distance_m is not None else "—")
+                metric_row("Material Height (m)", f"{material_height_m:.3f}" if material_height_m is not None else "—")
+            with b:
+                metric_row("Device Fill %", f"{material_pct_dev:.1f}%" if material_pct_dev is not None else "—")
+                metric_row("Calculated Tons", f"{ladle_tons:.2f}" if ladle_tons is not None else "—")
+            with c:
+                metric_row("Current (mA)", f"{current_ma:.1f}" if current_ma is not None else "—")
+                metric_row("Temperature (°C)", f"{temperature_c:.1f}" if temperature_c is not None else "—")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with q2:
+            st.markdown("<div class='quad'>", unsafe_allow_html=True)
+            st.markdown("### 🧭 Gyro")
+            g1, g2, g3 = st.columns(3)
+            gyro_columns = [g1, g2, g3]
+            if gyro:
+                for index, (label, key) in enumerate(GYRO_FIELDS):
+                    value = "—"
+                    if key in gyro and gyro[key] is not None:
+                        try:
+                            value = f"{float(gyro[key]):.2f}"
+                        except Exception:
+                            value = str(gyro[key])
+                    with gyro_columns[index % 3]:
+                        metric_row(label, value)
+            else:
+                metric_row("STATUS", "Waiting for gyro data...")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with q_status:
+            st.markdown(
+                f"""
+                <div style="
+                    height: var(--quadH);
+                    display: flex;
+                    align-items: flex-start;
+                    justify-content: flex-start;
+                    font-size: 1.6em;
+                    font-weight: 700;
+                    white-space: nowrap;
+                    padding-top: 1rem;
+                ">
+                    {'🟢 POURING' if pouring else '🟡 READY'}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with st.container(height=410, border=False):
+        q3, q4 = st.columns(2, gap="medium")
+
+        with q3:
+            st.markdown("<div class='quad'>", unsafe_allow_html=True)
+            st.markdown("### 🪣 Bucket Schematic")
+            fill_pct, ladle_img_path = snapped_ladle_image(material_pct_dev)
+            if ladle_img_path.exists():
+                st.image(str(ladle_img_path), width=300, caption=f"Fill Level: {fill_pct}%")
+            else:
+                st.warning(f"Missing image: {ladle_img_path.name}")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        with q4:
+            st.markdown("<div class='quad'>", unsafe_allow_html=True)
+            st.markdown("### 📷 Camera")
+            if frame is not None:
+                st.image(frame, width=400)
+            else:
+                st.info("Waiting for camera stream...")
+            st.markdown("</div>", unsafe_allow_html=True)
 
 
-
-# ---------- ROW 2 : Bucket Schematic + Camera ----------
-q3, q4 = st.columns(2, gap="medium")
-
-# 🪣 Bucket Schematic (driven by RADAR Device Fill %)
-with q3:
-    st.markdown("<div class='quad'>", unsafe_allow_html=True)
-    st.markdown("### 🪣 Bucket Schematic")
-
-    # ✅ Use RADAR Device Fill %
-    fill_pct = int(round(material_pct_dev)) if material_pct_dev is not None else 0
-    fill_pct = max(0, min(fill_pct, 100))
-
-    # snap to available images (0,5,10...)
-    fill_pct = int(round(fill_pct / 5) * 5)
-
-    ladle_img_path = (
-        Path(__file__).parent.parent
-        / "LadleImages"
-        / f"Ladle_Image_{fill_pct}.png"
-    )
-
-    if ladle_img_path.exists():
-        st.image(
-            str(ladle_img_path),
-            width=300,
-            caption=f"Fill Level: {fill_pct}%"
-        )
-    else:
-        st.warning(f"Missing image: {ladle_img_path.name}")
-
-
-# 4️⃣ Camera
-with q4:
-    st.markdown("<div class='quad'>", unsafe_allow_html=True)
-    st.markdown("### 📷 Camera")
-
-    if frame is not None:
-        st.image(frame, width=400)
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.info("Waiting for camera stream...")
-
-    st.markdown("</div>", unsafe_allow_html=True)
+live_dashboard(port, ladle_type, ss.pouring)
 
 
 
@@ -844,10 +874,17 @@ if ss.engineer_mode:
 # =====================================================
 # HISTORY + CALIBRATION MEMORY TABLES (CSV ONLY)
 # =====================================================
-st.markdown("---")
-st.subheader("📜 Pour History (CSV)")
-st.dataframe(pd.read_csv(HISTORY_FILE), use_container_width=True)
+@st.fragment(run_every="10s")
+def history_tables():
+    st.markdown("---")
+    st.subheader("📜 Pour History (CSV)")
+    history = read_csv_cached(HISTORY_FILE, file_mtime_ns(HISTORY_FILE))
+    st.dataframe(history, width="stretch")
 
-st.markdown("---")
-st.subheader("🧠 Ladle Calibration Memory (CSV)")
-st.dataframe(pd.read_csv(PROFILE_FILE), use_container_width=True)
+    st.markdown("---")
+    st.subheader("🧠 Ladle Calibration Memory (CSV)")
+    profiles = read_csv_cached(PROFILE_FILE, file_mtime_ns(PROFILE_FILE))
+    st.dataframe(profiles, width="stretch")
+
+
+history_tables()
